@@ -1,5 +1,5 @@
-deps/*.a
-.idea/*
+deps/
+.idea/
 log
 *.out
 *.xml
