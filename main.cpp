@@ -5,8 +5,12 @@
 #define _XOPEN_SOURCE
 #endif
 #include <ucontext.h>
+#include <vector>
+#include <set>
+#include <map>
 
-#include <assert.h>
+//#include <assert.h>
+#include <aio.h>
 
 class Observer {
 public:
@@ -323,6 +327,129 @@ SigFunc* SigLinkToDead(int signo, SigFunc* handler) {
     if (sigaction(signo, &act, &oact) < 0)
         return (SIG_ERR);
     return (handler);
+}
+
+class AsyncBase {
+public:
+    inline AsyncBase();
+    virtual ~AsyncBase();
+//    void ReadAsync(int);
+    class Task {
+    public:
+        virtual void run() = 0;
+    };
+};
+
+AsyncBase::AsyncBase() {}
+
+AsyncBase::~AsyncBase() {}
+
+typedef std::map<pid_t, sig_atomic_t> __type_mutex_map;
+
+static volatile __type_mutex_map pool_mutex;
+
+#define MUTEX_ON 0x00
+#define MUTEX_OFF 0x01
+
+class ProcPool {
+public:
+    static ProcPool& Self() {
+        static ProcPool self;
+        return self;
+    }
+
+    void Initialize() {
+        sigset_t new_mask;
+        //set barrie for IPC signal, or it get lost when it occurred before slaves suspend
+        sigemptyset(&new_mask);
+        sigaddset(&new_mask, SIGUSR1);
+        sigaddset(&new_mask, SIGUSR2);
+        //save current mask
+        if (sigprocmask(SIG_BLOCK, &new_mask, &mask) < 0)
+            perror("set mask of master error");
+    }
+
+    //no copy
+    ProcPool(ProcPool const&) = delete;
+    void operator=(ProcPool const&) = delete;
+
+    void Spawn();
+    inline size_t GetSize() const { return _size; }
+    void SetSize(size_t size) { _size = size; }
+
+    inline ~ProcPool() {}
+
+    enum Status {
+        kRunning,
+        kSuspended,
+    };
+
+    class ProcInfo {
+    public:
+        pid_t pid;
+        sigset_t old_mask, wait_mask;
+        void* context = nullptr;
+        Status state = kSuspended;
+
+        inline ProcInfo(pid_t);
+
+        void Await();
+    };
+
+    inline void AddToPool(ProcInfo& proc) {
+        _procs.push_back(proc);
+    }
+
+    inline void ClearPool() {
+        _procs.clear();
+    }
+
+private:
+    inline ProcPool() {}
+    size_t _size;
+    std::vector<ProcInfo> _procs;
+    sigset_t mask;
+};
+
+ProcPool::ProcInfo::ProcInfo(pid_t id) : pid(id) {
+    //after fork
+    //mask inherited from master's context
+    if (sigprocmask(0, nullptr, &old_mask) < 0)
+        perror("get old mask from master error");
+    auto temp_pool_mutex = const_cast<__type_mutex_map*>(&pool_mutex);
+    temp_pool_mutex->insert({pid, MUTEX_ON});
+}
+
+void ProcPool::ProcInfo::Await() {
+    sigemptyset(&wait_mask);
+    //atomic operations
+    //barrie exists
+    auto temp_pool_mutex = const_cast<__type_mutex_map*>(&pool_mutex);
+    volatile auto self_mutex_ref = &((*temp_pool_mutex)[pid]);
+    //compiler will optimize the following code
+    //while (true) {}
+    while (*self_mutex_ref == MUTEX_ON)
+        sigsuspend(&wait_mask);
+    *self_mutex_ref = MUTEX_ON;
+    //without reset mask
+}
+
+//schedule all slaves processes
+void ProcPool::Spawn() {
+    pid_t pid;
+    if ((pid = fork()) < 0)
+        perror("fork at processes pool error");
+    else if (pid == 0) {
+        //slaves process
+        ProcPool::ProcInfo info(getpid());
+        //register into pool
+        AddToPool(info);
+        //await until master schedule a work to it
+        info.Await();
+    } else {
+        //master
+        printf("zygote a slave process its pid = %d", pid);
+    }
 }
 
 int main() {
