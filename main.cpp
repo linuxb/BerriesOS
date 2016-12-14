@@ -6,6 +6,8 @@
 #endif
 #include <ucontext.h>
 
+#include <assert.h>
+
 class Observer {
 public:
     Observer() : msg_(0) {}
@@ -36,12 +38,6 @@ Observer *observer;
 
 void CleanupHandler(void *args) {
     printf("clean up handler work \n");
-}
-
-void MainSigHandler(int signal) {
-    if (SIGUSR1 == signal) {
-        printf("handle this user defined signal \n");
-    }
 }
 
 //#define SIG_IS_IN_MASK(set, sig) \
@@ -111,6 +107,63 @@ void Log(char* buf) {
 }
 
 #define MAX_LOG_SIZE 1024
+//mask of the master and slaves
+static volatile sig_atomic_t sig_mutex;
+static sigset_t old_mask, new_mask, mutex_mask;
+
+void SigMasterSlavesHandler(int signo) {
+    if (SIGUSR1 == signo) {
+        //sent by master, received by slaves
+        printf("PID : %d receive form my master\n", getpid());
+    } else if (SIGUSR2 == signo) {
+        //sent by slaves, received by master
+        printf("PID : %d receive form my slaves\n", getpid());
+    }
+    sig_mutex = 1;
+}
+
+//set barrie of this IPC signal avoiding they occurred before process suspend, which prepared for the signal
+void TellWait() {
+    if (signal(SIGUSR1, SigMasterSlavesHandler) == SIG_ERR)
+        perror("can not catch SIGUSR1");
+    if (signal(SIGUSR2, SigMasterSlavesHandler) == SIG_ERR)
+        perror("can not catch SIGUSR2");
+    sigemptyset(&mutex_mask);
+    sigemptyset(&new_mask);
+    sigaddset(&new_mask, SIGUSR1);
+    sigaddset(&new_mask, SIGUSR2);
+    if (sigprocmask(SIG_BLOCK, &new_mask, &old_mask) < 0)
+        perror("set mask error");
+    sig_mutex = 0;
+}
+
+void TellMaster(pid_t who) {
+    kill(who, SIGUSR2);
+}
+
+void TellSlaves(pid_t who) {
+    kill(who, SIGUSR1);
+}
+
+void WaitMaster() {
+    while (sig_mutex == 0)
+        sigsuspend(&mutex_mask);
+    sig_mutex = 0;
+
+    //reset mask
+    if (sigprocmask(SIG_SETMASK, &old_mask, nullptr) < 0)
+        perror("reset mask at slaves error");
+}
+
+void WaitSlaves() {
+    while (sig_mutex == 0)
+        sigsuspend(&mutex_mask);
+    sig_mutex = 0;
+
+    //reset mask
+    if (sigprocmask(SIG_SETMASK, &old_mask, nullptr) < 0)
+        perror("reset mask at master error");
+}
 
 void ForkSlave() {
     int shared_counter = 0;
@@ -122,12 +175,15 @@ void ForkSlave() {
     if (write(STDOUT_FILENO, buffer, sizeof(buffer) - 1) != sizeof(buffer) - 1)
         perror("write failed !\n");
     printf("start to fork a slave process\n");
+    TellWait();
     if ((pid = fork()) < 0) {
        perror("process fork error\n");
     } else if (pid == 0) {
         //slave process
         printf("need buffer \n");
+        WaitMaster();
         shared_counter++;
+        TellMaster(getppid());
         char log_buf[MAX_LOG_SIZE];
         memset(log_buf, 0, sizeof(log_buf));
         sprintf(log_buf, "I'm a slave PID : %ld, parent PID : %ld\n", (long)getpid(), (long)getppid());
@@ -137,6 +193,12 @@ void ForkSlave() {
         //parent process
         //wait for slave avoiding it make no sense if the master exit
         sleep(2);
+        //now command the slaves to modify shared area
+        printf("now let my slaves modify shared area\n");
+        TellSlaves(pid);
+        WaitSlaves();
+//        assert(shared_counter == 1);
+        printf("received from slaves when counter(but in stack on my slaves, need memory shared to see it) = 1\n");
         waitpid(pid, &status, 0);
         ReportToMaster(status);
     }
@@ -169,7 +231,8 @@ void *DoWork(void *args) {
 //        if (args) pthread_exit(heap_dyr);
     pthread_cleanup_pop(0);
     //send a signal to main thread when dying
-    raise(SIGUSR1);
+    //process is interrupted without handler of this signal
+//    raise(SIGUSR1);
     pthread_exit(heap_dyr);
 }
 
@@ -270,8 +333,6 @@ int main() {
     observer->update(std::move(ref));
     observer->Pump();
     pthread_t worker = ZygoteWorker();
-    if (signal(SIGUSR1, MainSigHandler) == SIG_ERR)
-        perror("can not catch SIGUSR1");
 //    if (signal(SIGALRM, OnTimeout) == SIG_ERR)
 //        perror("can not catch SIGALRM");
     if (SigLinkToDead<SigFuncInfo>(SIGALRM, OnTimeoutInfo) == reinterpret_cast<SigFuncInfo *>(SIG_ERR))
