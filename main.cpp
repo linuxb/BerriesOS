@@ -5,6 +5,7 @@
 #define _XOPEN_SOURCE
 #endif
 #include <ucontext.h>
+#include <assert.h>
 #include <vector>
 #include <set>
 #include <map>
@@ -344,12 +345,16 @@ AsyncBase::AsyncBase() {}
 
 AsyncBase::~AsyncBase() {}
 
-typedef std::map<pid_t, sig_atomic_t> __type_mutex_map;
+typedef std::map<pid_t, volatile sig_atomic_t> __type_mutex_map;
+typedef void (*__type_work_func)(void*);
+typedef void (*__type_work_cb)(void*);
 
-static volatile __type_mutex_map pool_mutex;
+static __type_mutex_map pool_mutex;
 
 #define MUTEX_ON 0x00
 #define MUTEX_OFF 0x01
+
+#define DEFAULT_POOL_SIZE 5
 
 class ProcPool {
 public:
@@ -358,30 +363,36 @@ public:
         return self;
     }
 
-    void Initialize() {
-        sigset_t new_mask;
-        //set barrie for IPC signal, or it get lost when it occurred before slaves suspend
-        sigemptyset(&new_mask);
-        sigaddset(&new_mask, SIGUSR1);
-        sigaddset(&new_mask, SIGUSR2);
-        //save current mask
-        if (sigprocmask(SIG_BLOCK, &new_mask, &mask) < 0)
-            perror("set mask of master error");
-    }
+    void Initialize();
 
     //no copy
     ProcPool(ProcPool const&) = delete;
     void operator=(ProcPool const&) = delete;
 
-    void Spawn();
+    void Schedule(__type_work_func, __type_work_cb, void*, void*);
+
     inline size_t GetSize() const { return _size; }
     void SetSize(size_t size) { _size = size; }
 
-    inline ~ProcPool() {}
+    inline ~ProcPool();
 
     enum Status {
-        kRunning,
-        kSuspended,
+        kRunning,   //working
+        kSuspended, //idle
+    };
+
+    class Task {
+    public:
+        inline Task(__type_work_func func, __type_work_cb cb, void* args, void* cb_args)
+            : func(func),
+              callback(cb),
+              args(args),
+              cb_args(cb_args)
+        {}
+        __type_work_func func;
+        __type_work_cb callback;
+        void* args;
+        void* cb_args;
     };
 
     class ProcInfo {
@@ -390,11 +401,23 @@ public:
         sigset_t old_mask, wait_mask;
         void* context = nullptr;
         Status state = kSuspended;
+        std::vector<Task> tasks;
 
         inline ProcInfo(pid_t);
 
+        void AtExit(int);
+
         void Await();
+        void Run();
     };
+
+private:
+    inline ProcPool() {}
+    void Spawn();
+    static void HandleMessage(int);
+    void ResumeSlave(pid_t);
+    void Massacre();
+    void KillASlave(pid_t);
 
     inline void AddToPool(ProcInfo& proc) {
         _procs.push_back(proc);
@@ -404,9 +427,7 @@ public:
         _procs.clear();
     }
 
-private:
-    inline ProcPool() {}
-    size_t _size;
+    size_t _size = DEFAULT_POOL_SIZE;
     std::vector<ProcInfo> _procs;
     sigset_t mask;
 };
@@ -416,22 +437,49 @@ ProcPool::ProcInfo::ProcInfo(pid_t id) : pid(id) {
     //mask inherited from master's context
     if (sigprocmask(0, nullptr, &old_mask) < 0)
         perror("get old mask from master error");
-    auto temp_pool_mutex = const_cast<__type_mutex_map*>(&pool_mutex);
-    temp_pool_mutex->insert({pid, MUTEX_ON});
+//    auto temp_pool_mutex = const_cast<__type_mutex_map*>(&pool_mutex);
+    pool_mutex.insert({pid, MUTEX_ON});
+    //slave will handle all its tasks before exit by accident
+    if (signal(SIGINT, AtExit) == SIG_ERR)
+        perror("can not catch SIGINT");
+    if (signal(SIGQUIT, AtExit) == SIG_ERR)
+        perror("can not catch SIGQUIT");
 }
 
 void ProcPool::ProcInfo::Await() {
     sigemptyset(&wait_mask);
     //atomic operations
     //barrie exists
-    auto temp_pool_mutex = const_cast<__type_mutex_map*>(&pool_mutex);
-    volatile auto self_mutex_ref = &((*temp_pool_mutex)[pid]);
+//    auto temp_pool_mutex = const_cast<__type_mutex_map*>(&pool_mutex);
+    auto self_mutex_ref = &(pool_mutex[pid]);
     //compiler will optimize the following code
     //while (true) {}
     while (*self_mutex_ref == MUTEX_ON)
         sigsuspend(&wait_mask);
     *self_mutex_ref = MUTEX_ON;
     //without reset mask
+}
+
+void ProcPool::ProcInfo::Run() {
+    assert(!tasks.empty());
+    //execute
+    for (std::vector<Task>::iterator task = tasks.begin(); task != tasks.end(); task++) {
+        printf("Slave PID = %d, I'm working\n", getpid());
+        task->func(task->args);
+        if (task->callback) {
+            task->callback(task->cb_args);
+        }
+    }
+}
+
+void ProcPool::ProcInfo::AtExit(int signo) {
+    if (signo == SIGINT || signo == SIGQUIT) {
+        if (!tasks.empty()) {
+            Run();
+        }
+        sleep(2);
+        exit(3);
+    }
 }
 
 //schedule all slaves processes
@@ -445,11 +493,93 @@ void ProcPool::Spawn() {
         //register into pool
         AddToPool(info);
         //await until master schedule a work to it
-        info.Await();
+        while (true) {
+            info.Await();
+            //turn into running state
+            info.state = kRunning;
+            info.Run();
+            sleep(2);
+            info.state = kSuspended;
+        }
     } else {
         //master
-        printf("zygote a slave process its pid = %d", pid);
+        printf("zygote a slave process its pid = %d\n", pid);
     }
+}
+
+void ProcPool::Schedule(__type_work_func func, __type_work_cb cb, void * args, void * cb_args) {
+    assert(!_procs.empty());
+    for (std::vector<ProcInfo>::iterator proc = _procs.begin(); proc != _procs.end(); proc++) {
+        if (proc->state == kSuspended) {
+            //push into its tasks queue
+            ProcPool::Task t(func, cb, args, cb_args);
+            //copy constructor
+            proc->tasks.push_back(t);
+            //await this slave
+            ResumeSlave(proc->pid);
+            break;
+        }
+    }
+}
+
+void ProcPool::ResumeSlave(pid_t who) {
+    //in master
+    kill(who, SIGUSR1);
+}
+
+void ProcPool::HandleMessage(int signo) {
+    //we need to handle SIGUSR1 and SIGUSR2
+    pid_t key = getpid();
+    //if volatile map
+//    auto temp_pool_mutex = const_cast<__type_mutex_map*>(&pool_mutex);
+    if (SIGUSR1 == signo) {
+        //sent by master, received by slave
+        volatile sig_atomic_t& mutex_ref = pool_mutex[key];
+        mutex_ref = MUTEX_OFF;
+    } else if (SIGUSR2 == signo) {
+        //sent by slave, received by master
+    }
+}
+
+void ProcPool::Initialize() {
+    sigset_t new_mask;
+    //register signal handler
+    if (signal(SIGUSR1, HandleMessage) == SIG_ERR)
+        perror("can not catch SIGUSR1");
+    if (signal(SIGUSR2, HandleMessage) == SIG_ERR)
+        perror("can not catch SIGUSR2");
+    //set barrie for IPC signal, or it get lost when it occurred before slaves suspend
+    sigemptyset(&new_mask);
+    sigaddset(&new_mask, SIGUSR1);
+    sigaddset(&new_mask, SIGUSR2);
+    //save current mask
+    if (sigprocmask(SIG_BLOCK, &new_mask, &mask) < 0)
+        perror("set mask of master error");
+    //pre-fork slaves for users
+    for (int i = 0; i < _size; i++) {
+        Spawn();
+    }
+    assert(_procs.size() == DEFAULT_POOL_SIZE);
+}
+
+void ProcPool::Massacre() {
+    if (!_procs.empty()) {
+        for (std::vector<ProcInfo>::iterator proc = _procs.begin(); proc != _procs.end(); proc++) {
+            KillASlave(proc->pid);
+        }
+    }
+}
+
+void ProcPool::KillASlave(pid_t who) {
+    kill(who, SIGINT);
+    waitpid(who, NULL, 0);
+
+}
+
+ProcPool::~ProcPool() {
+    Massacre();
+    ClearPool();
+    (const_cast<__type_mutex_map*>(&pool_mutex))->clear();
 }
 
 int main() {
