@@ -405,10 +405,13 @@ public:
 
         inline ProcInfo(pid_t);
 
-        void AtExit(int);
+        static void AtExit(ProcInfo&, int);
+        //clean up at a detached thread
+        static void WrappedCleanup(int);
 
         void Await();
         void Run();
+
     };
 
 private:
@@ -440,10 +443,11 @@ ProcPool::ProcInfo::ProcInfo(pid_t id) : pid(id) {
 //    auto temp_pool_mutex = const_cast<__type_mutex_map*>(&pool_mutex);
     pool_mutex.insert({pid, MUTEX_ON});
     //slave will handle all its tasks before exit by accident
-    if (signal(SIGINT, AtExit) == SIG_ERR)
+    //reinterpret_cast<void(*)(int)>(WrappedCleanup) in vain ^_^
+    if (signal(SIGINT, reinterpret_cast<void(*)(int)>(WrappedCleanup)) == SIG_ERR)
         perror("can not catch SIGINT");
-    if (signal(SIGQUIT, AtExit) == SIG_ERR)
-        perror("can not catch SIGQUIT");
+//    if (signal(SIGQUIT, AtExit) == SIG_ERR)
+//        perror("can not catch SIGQUIT");
 }
 
 void ProcPool::ProcInfo::Await() {
@@ -471,15 +475,26 @@ void ProcPool::ProcInfo::Run() {
         }
     }
 }
-
-void ProcPool::ProcInfo::AtExit(int signo) {
+//this member function can not be passed to signal handler as a pointer
+//as compiler will populate a 'this', which is a constant pointer to caller
+//this generated code is like that
+//X::f__mangling(register const X* this, args...(int)) {}
+//but handler requires pointer like that
+//void(f*)(int) instead of 'void(X::*f)(const X*, int)'
+//so handler must be a static function pointer
+void ProcPool::ProcInfo::AtExit(ProcPool::ProcInfo& self, int signo) {
     if (signo == SIGINT || signo == SIGQUIT) {
-        if (!tasks.empty()) {
-            Run();
+        if (!self.tasks.empty()) {
+            self.Run();
         }
         sleep(2);
         exit(3);
     }
+}
+
+void ProcPool::ProcInfo::WrappedCleanup(int signo) {
+    //need to get instance of ProcInfo from which is stored at shared memory
+    //or is obtained by semaphore
 }
 
 //schedule all slaves processes
@@ -579,7 +594,8 @@ void ProcPool::KillASlave(pid_t who) {
 ProcPool::~ProcPool() {
     Massacre();
     ClearPool();
-    (const_cast<__type_mutex_map*>(&pool_mutex))->clear();
+//    (const_cast<__type_mutex_map*>(&pool_mutex))->clear();
+    pool_mutex.clear();
 }
 
 int main() {
