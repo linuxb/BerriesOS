@@ -9,6 +9,8 @@
 #include <vector>
 #include <set>
 #include <map>
+#include <sys/msg.h>
+#include <sys/sem.h>
 
 //#include <assert.h>
 #include <aio.h>
@@ -16,6 +18,8 @@
 class Observer {
 public:
     Observer() : msg_(0) {}
+
+    Observer(int64_t msg_);
 
     virtual ~Observer() {}
 
@@ -414,6 +418,8 @@ public:
 
     };
 
+    typedef std::vector<ProcInfo> __type_procs_;
+
 private:
     inline ProcPool() {}
     void Spawn();
@@ -423,15 +429,18 @@ private:
     void KillASlave(pid_t);
 
     inline void AddToPool(ProcInfo& proc) {
-        _procs.push_back(proc);
+//        _procs.push_back(proc);
+        const_cast<__type_procs_*>(&_procs)->push_back(proc);
     }
 
+
     inline void ClearPool() {
-        _procs.clear();
+//        _procs.clear();
+        const_cast<__type_procs_*>(&_procs)->clear();
     }
 
     size_t _size = DEFAULT_POOL_SIZE;
-    std::vector<ProcInfo> _procs;
+    volatile std::vector<ProcInfo> _procs;
     sigset_t mask;
 };
 
@@ -506,8 +515,9 @@ void ProcPool::Spawn() {
         //slaves process
         ProcPool::ProcInfo info(getpid());
         //register into pool
+        //in a duplicated stack of child process, which has no infect in parent process's stack
         AddToPool(info);
-        //await until master schedule a work to it
+        //await until master schedule a work for it
         while (true) {
             info.Await();
             //turn into running state
@@ -523,8 +533,9 @@ void ProcPool::Spawn() {
 }
 
 void ProcPool::Schedule(__type_work_func func, __type_work_cb cb, void * args, void * cb_args) {
-    assert(!_procs.empty());
-    for (std::vector<ProcInfo>::iterator proc = _procs.begin(); proc != _procs.end(); proc++) {
+    auto temp_procs = const_cast<__type_procs_*>(&_procs);
+    assert(!temp_procs->empty());
+    for (std::vector<ProcInfo>::iterator proc = temp_procs->begin(); proc != temp_procs->end(); proc++) {
         if (proc->state == kSuspended) {
             //push into its tasks queue
             ProcPool::Task t(func, cb, args, cb_args);
@@ -574,12 +585,14 @@ void ProcPool::Initialize() {
     for (int i = 0; i < _size; i++) {
         Spawn();
     }
-    assert(_procs.size() == DEFAULT_POOL_SIZE);
+    auto temp_procs = const_cast<__type_procs_*>(&_procs);
+    assert(temp_procs->size() == _size);
 }
 
 void ProcPool::Massacre() {
-    if (!_procs.empty()) {
-        for (std::vector<ProcInfo>::iterator proc = _procs.begin(); proc != _procs.end(); proc++) {
+    auto temp_procs = const_cast<__type_procs_*>(&_procs);
+    if (!temp_procs->empty()) {
+        for (std::vector<ProcInfo>::iterator proc = temp_procs->begin(); proc != temp_procs->end(); proc++) {
             KillASlave(proc->pid);
         }
     }
@@ -598,7 +611,52 @@ ProcPool::~ProcPool() {
     pool_mutex.clear();
 }
 
-int main() {
+void ThreadSleepWalking(void* msg) {
+    //walking thread
+
+}
+
+void CommunicateWithMQ() {
+
+}
+
+//still requires global resource
+volatile static int resource = 0;
+
+void LockResWithSemaphore() {
+    key_t sem_key = IPC_PRIVATE;
+    pid_t pid;
+    int sem_id;
+    if ((sem_id = semget(sem_key, 1, IPC_CREAT)) < 0)
+        perror("acquire semaphore id error");
+//    printf("error status: %d\n", errno);
+    //define operations to semaphore set
+    sembuf ops[] = { { 0, -1, SEM_UNDO } };
+    //parent locks resource before forking
+    if (semop(sem_id, ops, 1) < 0)
+        perror("set ops to semaphore set error");
+
+    //fork a child for preemption
+    if ((pid = fork()) < 0) {
+        perror("fork child error");
+    } else if (pid == 0) {
+        //child
+        //test the sem of resource, only run before parent locks it,
+        //it won't await until its parent release the resource
+        //attempts to access to resource
+        printf("child will access to resource\n");
+        resource++;
+        printf("wake up\n");
+    } else {
+        //parent
+        //wait for child
+        //parent block, which may result in dead lock
+        printf("wait for child\n");
+        wait(nullptr);
+    }
+}
+
+void RunAllThreads() {
     observer = new Observer;
     uv_loop_t *loop = uv_default_loop();
     uv_run(loop, UV_RUN_ONCE);
@@ -627,8 +685,27 @@ int main() {
 //    pthread_cancel(worker);
     //core dump (access to bad memory)
     delete observer;
-    //process fork experiment
-    ForkSlave();
-    PrintSigMask();
+}
+
+void MicroTask(void* args) {
+    printf("working at PID : %d", getpid());
+}
+
+void RunProcessesPool() {
+    ProcPool& pool = ProcPool::Self();
+    pool.SetSize(5);
+    pool.Initialize();
+    for (int i = 0; i < 5; i++) {
+        pool.Schedule(MicroTask, nullptr, nullptr, nullptr);
+    }
+}
+
+//    RunAllThreads();
+//process fork experiment
+//    ForkSlave();
+//    PrintSigMask();
+//    RunProcessesPool();
+int main() {
+    LockResWithSemaphore();
     return 0;
 }
